@@ -14,6 +14,7 @@
     - Searches sender and recipient addresses for a target domain
     - Commits results per PST after successful processing
     - Optionally exports matching emails into found_mails as .msg or .eml
+    - Handles Outlook RPC/COM session loss by resetting Outlook and retrying the current PST
     - Writes log output and shows progress with elapsed time and ETA
 
 .NOTES
@@ -33,25 +34,34 @@ $ErrorActionPreference = 'Stop'
 # Configuration - edit these values before running the script
 # ------------------------------------------------------------
 $Config = [ordered]@{
-    ZipRoot            = 'Z:\path\to\your\zippes\pst\files'
-    TargetDomain       = '@exmaple.com'
+    ZipRoot                     = 'Z:\path\to\your\zipped\psts'
+    TargetDomain                = '@example.com'
 
-    TempRoot           = 'F:\path\to\temp\folder'
-    OutputCsv          = ''   # If empty: <TempRoot>\pst_hunt0r_results.csv
-    StateRoot          = ''   # If empty: <TempRoot>\state
-    FoundMailsRoot     = ''   # If empty: <TempRoot>\found_mails
+    TempRoot                    = 'F:\path\to\your\temp\folder'
+    OutputCsv                   = ''   # If empty: <TempRoot>\pst_hunt0r_results.csv
+    StateRoot                   = ''   # If empty: <TempRoot>\state
+    FoundMailsRoot              = ''   # If empty: <TempRoot>\found_mails
 
-    ExportMatchedMails = $true
-    ExportFormat       = 'msg'   # msg | eml
+    ExportMatchedMails          = $true
+    ExportFormat                = 'msg'   # msg | eml
 
-    EnableResume       = $true
-    StrictStateSafety  = $true
-    StartFresh         = $false
+    EnableResume                = $true
+    StrictStateSafety           = $true
+    StartFresh                  = $false
 
-    KeepExtractedFiles = $false
+    KeepExtractedFiles          = $false
 
-    DeleteRetryCount   = 10
-    DeleteRetryDelayMs = 750
+    DeleteRetryCount            = 10
+    DeleteRetryDelayMs          = 750
+
+    # Outlook / RPC robustness
+    PstRetryCount               = 4
+    OutlookStartRetryCount      = 4
+    OutlookStartRetryDelayMs    = 3000
+    OutlookRecoveryDelayMs      = 4000
+    InterPstDelayMs             = 300
+    RecycleOutlookSessionAfterPst = 8
+    ForceOutlookQuitOnRecovery  = $false
 }
 
 # ------------------------------------------------------------
@@ -69,9 +79,9 @@ if ([string]::IsNullOrWhiteSpace($Config.FoundMailsRoot)) {
     $Config.FoundMailsRoot = Join-Path -Path $Config.TempRoot -ChildPath 'found_mails'
 }
 
-$script:StageRoot       = Join-Path -Path $Config.StateRoot -ChildPath 'stage'
-$script:CheckpointPath  = Join-Path -Path $Config.StateRoot -ChildPath 'checkpoint.json'
-$script:LogPath         = Join-Path -Path $Config.StateRoot -ChildPath 'pst_hunt0r.log'
+$script:StageRoot      = Join-Path -Path $Config.StateRoot -ChildPath 'stage'
+$script:CheckpointPath = Join-Path -Path $Config.StateRoot -ChildPath 'checkpoint.json'
+$script:LogPath        = Join-Path -Path $Config.StateRoot -ChildPath 'pst_hunt0r.log'
 
 # ------------------------------------------------------------
 # Script state
@@ -95,6 +105,9 @@ $script:TargetDomainNormalized  = $null
 $script:PrSmtpAddressUri        = "http://schemas.microsoft.com/mapi/proptag/0x39FE001F"
 
 $script:CheckpointState         = $null
+$script:OutlookApp              = $null
+$script:OutlookNamespace        = $null
+$script:ProcessedPstInSession   = 0
 
 $script:CsvColumns = @(
     'ZipFile',
@@ -152,7 +165,7 @@ function Write-Log {
     switch ($Level) {
         'INFO'  { Write-Host $line -ForegroundColor Cyan }
         'WARN'  { Write-Warning $Message }
-        'ERROR' { Write-Error $Message }
+        'ERROR' { Write-Host $line -ForegroundColor Red }
     }
 }
 
@@ -621,10 +634,10 @@ function Update-ProgressBars {
     }
 
     $overallStatus = if ($script:OverallTotalPst -gt 0) {
-        "ZIP $($script:ProcessedZipCount)/$($script:TotalZipCount) | Pending PST $($script:OverallProcessedPst)/$($script:OverallTotalPst) | Committed hits $($script:CommittedHitCount) | Elapsed $(Format-Duration $elapsedOverall) | ETA $(Format-Duration $overallEta)"
+        "ZIP $($script:ProcessedZipCount)/$($script:TotalZipCount) | PST $($script:OverallProcessedPst)/$($script:OverallTotalPst) | Hits this run $($script:CommittedHitCount) | Elapsed $(Format-Duration $elapsedOverall) | ETA $(Format-Duration $overallEta)"
     }
     else {
-        "ZIP $($script:ProcessedZipCount)/$($script:TotalZipCount) | Committed hits $($script:CommittedHitCount) | Elapsed $(Format-Duration $elapsedOverall) | ETA $(Format-Duration $overallEta)"
+        "ZIP $($script:ProcessedZipCount)/$($script:TotalZipCount) | Hits this run $($script:CommittedHitCount) | Elapsed $(Format-Duration $elapsedOverall) | ETA $(Format-Duration $overallEta)"
     }
 
     $overallOperation = if ($script:CurrentZipName) {
@@ -647,7 +660,7 @@ function Update-ProgressBars {
         }
 
         $zipStatus = if ($script:CurrentZipTotalPst -gt 0) {
-            "ZIP $($script:CurrentZipIndex)/$($script:TotalZipCount) | Pending PST $($script:CurrentZipProcessedPst)/$($script:CurrentZipTotalPst) | Committed hits $($script:CommittedHitCount) | Elapsed $(Format-Duration $zipElapsed) | ETA $(Format-Duration $zipEta)"
+            "ZIP $($script:CurrentZipIndex)/$($script:TotalZipCount) | PST $($script:CurrentZipProcessedPst)/$($script:CurrentZipTotalPst) | Hits this run $($script:CommittedHitCount) | Elapsed $(Format-Duration $zipElapsed) | ETA $(Format-Duration $zipEta)"
         }
         else {
             "ZIP $($script:CurrentZipIndex)/$($script:TotalZipCount) | No pending PST files | Elapsed $(Format-Duration $zipElapsed)"
@@ -671,6 +684,201 @@ function Complete-ProgressBars {
     Write-Progress -Id 1 -ParentId 0 -Activity 'Current ZIP File' -Completed
     Write-Progress -Id 0 -Activity 'Overall Progress' -Completed
 }
+
+# ------------------------------------------------------------
+# Outlook / RPC recovery functions
+# ------------------------------------------------------------
+
+function Get-ExceptionChainMessages {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Exception]$Exception
+    )
+
+    $list = New-Object 'System.Collections.Generic.List[string]'
+    $current = $Exception
+
+    while ($null -ne $current) {
+        if (-not [string]::IsNullOrWhiteSpace($current.Message)) {
+            [void]$list.Add($current.Message.ToLowerInvariant())
+        }
+        $current = $current.InnerException
+    }
+
+    return $list
+}
+
+function Get-ExceptionChainHResults {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Exception]$Exception
+    )
+
+    $list = New-Object 'System.Collections.Generic.List[string]'
+    $current = $Exception
+
+    while ($null -ne $current) {
+        try {
+            $hex = ('0x{0:X8}' -f ($current.HResult -band 0xffffffff))
+            [void]$list.Add($hex.ToLowerInvariant())
+        }
+        catch {
+            # ignored
+        }
+
+        $current = $current.InnerException
+    }
+
+    return $list
+}
+
+function Test-IsRecoverableOutlookSessionError {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Exception]$Exception
+    )
+
+    $messages = Get-ExceptionChainMessages -Exception $Exception
+    $hresults = Get-ExceptionChainHResults -Exception $Exception
+
+    $messagePatterns = @(
+        'rpc server is unavailable',
+        'der rpc-server ist nicht verfügbar',
+        'remote procedure call failed',
+        'rpc_e_server_died',
+        'object invoked has disconnected from its clients',
+        'von seinen clients getrennt',
+        'server threw an exception',
+        'the message filter indicated that the application is busy',
+        'call was rejected by callee'
+    )
+
+    foreach ($msg in $messages) {
+        foreach ($pattern in $messagePatterns) {
+            if ($msg -like ('*' + $pattern + '*')) {
+                return $true
+            }
+        }
+    }
+
+    $recoverableHResults = @(
+        '0x800706ba', # RPC_S_SERVER_UNAVAILABLE
+        '0x800706be', # RPC_S_CALL_FAILED
+        '0x80010108', # RPC_E_DISCONNECTED
+        '0x80010105', # RPC_E_SERVERFAULT
+        '0x80010001'  # RPC_E_CALL_REJECTED / call rejected by callee family
+    )
+
+    foreach ($hr in $hresults) {
+        if ($recoverableHResults -contains $hr) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Stop-OutlookSession {
+    param(
+        [string]$Reason = 'No reason specified'
+    )
+
+    Write-Log -Level 'INFO' -Message ("Stopping Outlook COM session. Reason: {0}" -f $Reason)
+
+    if ($Config.ForceOutlookQuitOnRecovery -and $null -ne $script:OutlookApp) {
+        try {
+            $script:OutlookApp.Quit()
+        }
+        catch {
+            # ignored
+        }
+    }
+
+    Release-ComObject -Obj $script:OutlookNamespace
+    Release-ComObject -Obj $script:OutlookApp
+
+    $script:OutlookNamespace      = $null
+    $script:OutlookApp            = $null
+    $script:ProcessedPstInSession = 0
+
+    Invoke-ComReleaseCycle
+    Start-Sleep -Milliseconds 1500
+}
+
+function Start-OutlookSession {
+    if ($null -ne $script:OutlookApp -and $null -ne $script:OutlookNamespace) {
+        return
+    }
+
+    $lastError = $null
+
+    for ($attempt = 1; $attempt -le [int]$Config.OutlookStartRetryCount; $attempt++) {
+        try {
+            Write-Log -Level 'INFO' -Message ("Starting Outlook COM session (attempt {0}/{1})" -f $attempt, $Config.OutlookStartRetryCount)
+
+            $script:OutlookApp = New-Object -ComObject Outlook.Application
+            Start-Sleep -Milliseconds 1200
+
+            $script:OutlookNamespace = $script:OutlookApp.GetNamespace("MAPI")
+            $null = $script:OutlookNamespace.Stores.Count
+
+            $script:ProcessedPstInSession = 0
+
+            Write-Log -Level 'INFO' -Message "Outlook COM session is ready."
+            return
+        }
+        catch {
+            $lastError = $_.Exception.Message
+
+            Release-ComObject -Obj $script:OutlookNamespace
+            Release-ComObject -Obj $script:OutlookApp
+            $script:OutlookNamespace = $null
+            $script:OutlookApp = $null
+
+            Invoke-ComReleaseCycle
+            Start-Sleep -Milliseconds ([int]$Config.OutlookStartRetryDelayMs)
+        }
+    }
+
+    throw "Failed to start Outlook COM session after $($Config.OutlookStartRetryCount) attempts. Last error: $lastError"
+}
+
+function Ensure-OutlookSessionHealthy {
+    if ($null -eq $script:OutlookApp -or $null -eq $script:OutlookNamespace) {
+        Start-OutlookSession
+        return
+    }
+
+    try {
+        $null = $script:OutlookNamespace.Stores.Count
+    }
+    catch {
+        if (Test-IsRecoverableOutlookSessionError -Exception $_.Exception) {
+            Write-Log -Level 'WARN' -Message ("Outlook session health check failed with a recoverable COM/RPC error: {0}" -f $_.Exception.Message)
+            Stop-OutlookSession -Reason 'Recoverable health check failure'
+            Start-OutlookSession
+            return
+        }
+
+        throw
+    }
+}
+
+function Reset-OutlookSession {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Reason
+    )
+
+    Write-Log -Level 'WARN' -Message ("Resetting Outlook COM session. Reason: {0}" -f $Reason)
+    Stop-OutlookSession -Reason $Reason
+    Start-Sleep -Milliseconds ([int]$Config.OutlookRecoveryDelayMs)
+    Start-OutlookSession
+}
+
+# ------------------------------------------------------------
+# Mail parsing helpers
+# ------------------------------------------------------------
 
 function Test-IsTargetDomain {
     param([AllowNull()][string]$Value)
@@ -767,7 +975,7 @@ function Get-RecipientSmtps {
                 $address = Get-SmtpFromAddressEntry -AddressEntry $recipient.AddressEntry
             }
             catch {
-                # Fallback below
+                # fallback below
             }
 
             if (-not $address) {
@@ -784,7 +992,9 @@ function Get-RecipientSmtps {
             }
         }
         catch {
-            # Recipient issues are not fatal
+            if (Test-IsRecoverableOutlookSessionError -Exception $_.Exception) {
+                throw
+            }
         }
         finally {
             Release-ComObject -Obj $recipient
@@ -833,7 +1043,9 @@ function Get-StoreByFilePath {
                 }
             }
             catch {
-                # Ignored
+                if (Test-IsRecoverableOutlookSessionError -Exception $_.Exception) {
+                    throw
+                }
             }
             finally {
                 if ($null -ne $store -and -not $isMatch) {
@@ -918,6 +1130,10 @@ function Get-UniqueFilePath {
     return $candidate
 }
 
+# ------------------------------------------------------------
+# Stage / commit helpers
+# ------------------------------------------------------------
+
 function Initialize-StageContext {
     param(
         [Parameter(Mandatory = $true)]
@@ -939,7 +1155,7 @@ function Initialize-StageContext {
 
     Ensure-Directory -Path $stagePath
 
-    $stageCsvPath = Join-Path -Path $stagePath -ChildPath 'stage_results.csv'
+    $stageCsvPath  = Join-Path -Path $stagePath -ChildPath 'stage_results.csv'
     $stageMailRoot = Join-Path -Path $stagePath -ChildPath 'mails'
 
     $utf8Bom = New-Object System.Text.UTF8Encoding($true)
@@ -956,14 +1172,14 @@ function Initialize-StageContext {
     }
 
     return @{
-        WorkKey            = $WorkKey
-        StagePath          = $stagePath
-        StageCsvPath       = $stageCsvPath
-        StageMailRoot      = $stageMailRoot
-        RelativeMailRoot   = $relativeMailRoot
-        CsvWriter          = $writer
-        HitCount           = 0
-        MailCounter        = 0
+        WorkKey          = $WorkKey
+        StagePath        = $stagePath
+        StageCsvPath     = $stageCsvPath
+        StageMailRoot    = $stageMailRoot
+        RelativeMailRoot = $relativeMailRoot
+        CsvWriter        = $writer
+        HitCount         = 0
+        MailCounter      = 0
     }
 }
 
@@ -979,7 +1195,7 @@ function Close-StageContext {
             $StageContext.CsvWriter.Dispose()
         }
         catch {
-            # Intentionally ignored
+            # ignored
         }
         finally {
             $StageContext.CsvWriter = $null
@@ -1114,6 +1330,10 @@ function Save-FoundMailToStage {
         }
     }
     catch {
+        if (Test-IsRecoverableOutlookSessionError -Exception $_.Exception) {
+            throw
+        }
+
         return @{
             RelativePath = ''
             Status       = ('save_failed: ' + $_.Exception.Message)
@@ -1200,6 +1420,10 @@ function Abandon-PstStage {
     [void](Remove-DirectoryRobust -Path $StageContext.StagePath -RetryCount $Config.DeleteRetryCount -RetryDelayMs $Config.DeleteRetryDelayMs -Quiet)
 }
 
+# ------------------------------------------------------------
+# ZIP inventory
+# ------------------------------------------------------------
+
 function Get-ZipInventory {
     param(
         [Parameter(Mandatory = $true)]
@@ -1261,6 +1485,10 @@ function Get-ZipInventory {
     }
 }
 
+# ------------------------------------------------------------
+# PST processing
+# ------------------------------------------------------------
+
 function Search-MailFolderRecursive {
     param(
         $Folder,
@@ -1290,9 +1518,12 @@ function Search-MailFolderRecursive {
 
                 $isMail = $false
                 try {
-                    $isMail = ($item.Class -eq 43) # olMail
+                    $isMail = ($item.Class -eq 43)
                 }
                 catch {
+                    if (Test-IsRecoverableOutlookSessionError -Exception $_.Exception) {
+                        throw
+                    }
                     $isMail = $false
                 }
 
@@ -1336,6 +1567,10 @@ function Search-MailFolderRecursive {
                 }
             }
             catch {
+                if (Test-IsRecoverableOutlookSessionError -Exception $_.Exception) {
+                    throw
+                }
+
                 Write-Log -Level 'WARN' -Message ("Error reading an item in folder '{0}' from PST '{1}': {2}" -f $folderPath, $PstRelativePath, $_.Exception.Message)
             }
             finally {
@@ -1344,6 +1579,10 @@ function Search-MailFolderRecursive {
         }
     }
     catch {
+        if (Test-IsRecoverableOutlookSessionError -Exception $_.Exception) {
+            throw
+        }
+
         Write-Log -Level 'WARN' -Message ("Error reading items in folder '{0}' from PST '{1}': {2}" -f $folderPath, $PstRelativePath, $_.Exception.Message)
     }
     finally {
@@ -1363,6 +1602,10 @@ function Search-MailFolderRecursive {
                 Search-MailFolderRecursive -Folder $sub -ZipFilePath $ZipFilePath -PstRelativePath $PstRelativePath -StageContext $StageContext
             }
             catch {
+                if (Test-IsRecoverableOutlookSessionError -Exception $_.Exception) {
+                    throw
+                }
+
                 Write-Log -Level 'WARN' -Message ("Error entering a subfolder under '{0}' in PST '{1}': {2}" -f $folderPath, $PstRelativePath, $_.Exception.Message)
             }
             finally {
@@ -1371,6 +1614,10 @@ function Search-MailFolderRecursive {
         }
     }
     catch {
+        if (Test-IsRecoverableOutlookSessionError -Exception $_.Exception) {
+            throw
+        }
+
         Write-Log -Level 'WARN' -Message ("Error reading subfolders in '{0}' from PST '{1}': {2}" -f $folderPath, $PstRelativePath, $_.Exception.Message)
     }
     finally {
@@ -1380,6 +1627,7 @@ function Search-MailFolderRecursive {
 
 function Process-PstFile {
     param(
+        [Parameter(Mandatory = $true)]
         $Namespace,
 
         [Parameter(Mandatory = $true)]
@@ -1419,7 +1667,9 @@ function Process-PstFile {
                 $Namespace.RemoveStore($rootFolder)
             }
             catch {
-                Write-Log -Level 'WARN' -Message ("PST could not be cleanly removed from Outlook: {0}" -f $PstPath)
+                if (-not (Test-IsRecoverableOutlookSessionError -Exception $_.Exception)) {
+                    Write-Log -Level 'WARN' -Message ("PST could not be cleanly removed from Outlook: {0}" -f $PstPath)
+                }
             }
         }
 
@@ -1430,6 +1680,126 @@ function Process-PstFile {
         Start-Sleep -Milliseconds 500
     }
 }
+
+function Process-PstWithRecovery {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileInfo]$ZipFile,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PstPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PstRelativePath
+    )
+
+    $workKey = Get-PstWorkKey -ZipFile $ZipFile -PstRelativePath $PstRelativePath
+    $maxAttempts = [int]$Config.PstRetryCount
+
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $stageContext = $null
+        $processingSucceeded = $false
+
+        try {
+            Ensure-OutlookSessionHealthy
+
+            $stageContext = Initialize-StageContext -ZipFile $ZipFile -PstRelativePath $PstRelativePath -WorkKey $workKey
+
+            Write-Log -Level 'INFO' -Message ("Processing PST attempt {0}/{1}: {2}" -f $attempt, $maxAttempts, $PstRelativePath)
+
+            Process-PstFile `
+                -Namespace $script:OutlookNamespace `
+                -PstPath $PstPath `
+                -ZipFilePath $ZipFile.FullName `
+                -PstRelativePath $PstRelativePath `
+                -StageContext $stageContext
+
+            $processingSucceeded = $true
+        }
+        catch {
+            $isRecoverable = Test-IsRecoverableOutlookSessionError -Exception $_.Exception
+
+            if ($null -ne $stageContext) {
+                Abandon-PstStage -StageContext $stageContext
+            }
+
+            if ($isRecoverable) {
+                Write-Log -Level 'WARN' -Message ("Recoverable Outlook RPC/COM failure while processing PST '{0}' (attempt {1}/{2}): {3}" -f $PstRelativePath, $attempt, $maxAttempts, $_.Exception.Message)
+
+                if ($attempt -lt $maxAttempts) {
+                    try {
+                        Reset-OutlookSession -Reason ("Recoverable PST processing failure for {0}" -f $PstRelativePath)
+                    }
+                    catch {
+                        Write-Log -Level 'WARN' -Message ("Outlook session reset failed after recoverable PST error: {0}" -f $_.Exception.Message)
+                    }
+
+                    continue
+                }
+
+                Write-Log -Level 'WARN' -Message ("Skipping PST after exhausting retries due to repeated recoverable Outlook RPC/COM failures: {0}" -f $PstRelativePath)
+
+                try {
+                    Reset-OutlookSession -Reason ("Final recovery reset after giving up on PST {0}" -f $PstRelativePath)
+                }
+                catch {
+                    Write-Log -Level 'WARN' -Message ("Outlook session reset after final PST failure also failed: {0}" -f $_.Exception.Message)
+                }
+
+                return $false
+            }
+
+            Write-Log -Level 'WARN' -Message ("Non-recoverable PST processing error for '{0}': {1}" -f $PstRelativePath, $_.Exception.Message)
+            return $false
+        }
+
+        if ($processingSucceeded) {
+            try {
+                Commit-PstStage `
+                    -StageContext $stageContext `
+                    -MasterCsvPath $Config.OutputCsv `
+                    -FoundMailsRoot $Config.FoundMailsRoot `
+                    -CheckpointState $script:CheckpointState `
+                    -CheckpointPath $script:CheckpointPath
+
+                Write-Log -Level 'INFO' -Message ("Committed PST successfully: {0} | Hits committed from this PST: {1}" -f $PstRelativePath, $stageContext.HitCount)
+
+                $script:ProcessedPstInSession++
+
+                if (($Config.RecycleOutlookSessionAfterPst -gt 0) -and ($script:ProcessedPstInSession -ge [int]$Config.RecycleOutlookSessionAfterPst)) {
+                    try {
+                        Reset-OutlookSession -Reason ("Planned session recycle after {0} PST files" -f $script:ProcessedPstInSession)
+                    }
+                    catch {
+                        Write-Log -Level 'WARN' -Message ("Planned Outlook session recycle failed: {0}" -f $_.Exception.Message)
+                    }
+                }
+
+                return $true
+            }
+            catch {
+                Write-Log -Level 'ERROR' -Message ("Failed to commit staged results for PST '{0}'. This PST will not be retried automatically to avoid duplicates. Error: {1}" -f $PstRelativePath, $_.Exception.Message)
+
+                if ($null -ne $stageContext) {
+                    try {
+                        Abandon-PstStage -StageContext $stageContext
+                    }
+                    catch {
+                        # ignored
+                    }
+                }
+
+                return $false
+            }
+        }
+    }
+
+    return $false
+}
+
+# ------------------------------------------------------------
+# Cleanup helpers
+# ------------------------------------------------------------
 
 function Cleanup-StaleExtractDirs {
     param(
@@ -1467,11 +1837,12 @@ function Cleanup-StaleStageDirs {
     }
 }
 
+# ------------------------------------------------------------
+# ZIP processing
+# ------------------------------------------------------------
+
 function Process-ZipFile {
     param(
-        [Parameter(Mandatory = $true)]
-        $Namespace,
-
         [Parameter(Mandatory = $true)]
         [pscustomobject]$ZipInventory
     )
@@ -1534,46 +1905,14 @@ function Process-ZipFile {
             $script:CurrentPhase   = 'Processing PST'
             Update-ProgressBars
 
-            $stageContext = Initialize-StageContext -ZipFile $zip -PstRelativePath $relativePath -WorkKey $workKey
-            $pstCompleted = $false
+            [void](Process-PstWithRecovery -ZipFile $zip -PstPath $pst.FullName -PstRelativePath $relativePath)
 
-            try {
-                Process-PstFile `
-                    -Namespace $Namespace `
-                    -PstPath $pst.FullName `
-                    -ZipFilePath $zip.FullName `
-                    -PstRelativePath $relativePath `
-                    -StageContext $stageContext
+            $script:CurrentZipProcessedPst++
+            $script:OverallProcessedPst++
+            Update-ProgressBars
 
-                $pstCompleted = $true
-            }
-            catch {
-                Write-Log -Level 'WARN' -Message ("Fatal PST-level error while processing '{0}' from ZIP '{1}': {2}" -f $relativePath, $zip.FullName, $_.Exception.Message)
-            }
-            finally {
-                if ($pstCompleted) {
-                    try {
-                        Commit-PstStage `
-                            -StageContext $stageContext `
-                            -MasterCsvPath $Config.OutputCsv `
-                            -FoundMailsRoot $Config.FoundMailsRoot `
-                            -CheckpointState $script:CheckpointState `
-                            -CheckpointPath $script:CheckpointPath
-
-                        Write-Log -Level 'INFO' -Message ("Committed PST successfully: {0} | Hits committed from this PST: {1}" -f $relativePath, $stageContext.HitCount)
-                    }
-                    catch {
-                        Write-Log -Level 'WARN' -Message ("Failed to commit staged results for PST '{0}': {1}" -f $relativePath, $_.Exception.Message)
-                        Abandon-PstStage -StageContext $stageContext
-                    }
-                }
-                else {
-                    Abandon-PstStage -StageContext $stageContext
-                }
-
-                $script:CurrentZipProcessedPst++
-                $script:OverallProcessedPst++
-                Update-ProgressBars
+            if ([int]$Config.InterPstDelayMs -gt 0) {
+                Start-Sleep -Milliseconds ([int]$Config.InterPstDelayMs)
             }
         }
 
@@ -1603,23 +1942,22 @@ function Process-ZipFile {
 # ------------------------------------------------------------
 # Main
 # ------------------------------------------------------------
+
 try {
     Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
 }
 catch {
-    # Usually harmless if already loaded
+    # harmless if already loaded
 }
 
-# Normalize target domain
 $script:TargetDomainNormalized = Normalize-Email -Value $Config.TargetDomain
 if (-not $script:TargetDomainNormalized) {
     throw "TargetDomain is empty or invalid."
 }
-if (-not $script:TargetDomainNormalized.StartsWith('@')) {
+if (-not ($script:TargetDomainNormalized.StartsWith('@'))) {
     $script:TargetDomainNormalized = '@' + $script:TargetDomainNormalized
 }
 
-# Basic validation
 if ([string]::IsNullOrWhiteSpace($Config.ZipRoot)) {
     throw "ZipRoot is empty. Please set it in the configuration block."
 }
@@ -1630,7 +1968,6 @@ if ($Config.ExportFormat.ToLowerInvariant() -notin @('msg','eml')) {
     throw "ExportFormat must be 'msg' or 'eml'."
 }
 
-# Prepare directories
 Ensure-Directory -Path $Config.TempRoot
 Ensure-Directory -Path $Config.StateRoot
 Ensure-Directory -Path $script:StageRoot
@@ -1639,7 +1976,6 @@ if ($Config.ExportMatchedMails) {
     Ensure-Directory -Path $Config.FoundMailsRoot
 }
 
-# Start fresh if requested
 if ($Config.StartFresh) {
     Write-Log -Level 'WARN' -Message "StartFresh is enabled. Existing output/state for this run will be removed."
 
@@ -1654,18 +1990,15 @@ if ($Config.StartFresh) {
     }
 }
 
-# Cleanup leftovers from earlier interrupted runs
 Cleanup-StaleExtractDirs -TempRoot $Config.TempRoot
 Cleanup-StaleStageDirs -StageRoot $script:StageRoot
 
-# State checks
 Assert-StateConsistency `
     -OutputCsv $Config.OutputCsv `
     -CheckpointPath $script:CheckpointPath `
     -EnableResume $Config.EnableResume `
     -StrictStateSafety $Config.StrictStateSafety
 
-# Load state
 if ($Config.EnableResume) {
     $script:CheckpointState = Load-CheckpointState -Path $script:CheckpointPath
 }
@@ -1675,11 +2008,7 @@ else {
     }
 }
 
-# Initialize master CSV
 Initialize-MasterCsv -Path $Config.OutputCsv
-
-$outlook   = $null
-$namespace = $null
 
 try {
     $script:CurrentPhase = 'Searching for ZIP files'
@@ -1729,22 +2058,26 @@ try {
         return
     }
 
-    $script:CurrentPhase = 'Starting Outlook COM'
-    Update-ProgressBars
-
-    Write-Log -Level 'INFO' -Message "Starting Outlook COM"
-    $outlook = New-Object -ComObject Outlook.Application
-    $namespace = $outlook.GetNamespace("MAPI")
+    Start-OutlookSession
 
     for ($z = 0; $z -lt $zipInventoryList.Count; $z++) {
         $zipInfo = $zipInventoryList[$z]
         $script:CurrentZipIndex = $z + 1
 
         try {
-            Process-ZipFile -Namespace $namespace -ZipInventory $zipInfo
+            Process-ZipFile -ZipInventory $zipInfo
         }
         catch {
             Write-Log -Level 'WARN' -Message ("Unhandled ZIP-level error for '{0}': {1}" -f $zipInfo.ZipFile.FullName, $_.Exception.Message)
+
+            if (Test-IsRecoverableOutlookSessionError -Exception $_.Exception) {
+                try {
+                    Reset-OutlookSession -Reason ("Unhandled ZIP-level recoverable error for {0}" -f $zipInfo.ZipFile.FullName)
+                }
+                catch {
+                    Write-Log -Level 'WARN' -Message ("ZIP-level Outlook reset also failed: {0}" -f $_.Exception.Message)
+                }
+            }
         }
         finally {
             $script:ProcessedZipCount++
@@ -1770,8 +2103,12 @@ try {
 finally {
     Complete-ProgressBars
 
-    Release-ComObject -Obj $namespace
-    Release-ComObject -Obj $outlook
+    try {
+        Stop-OutlookSession -Reason 'Script shutdown'
+    }
+    catch {
+        # ignored
+    }
 
     Invoke-ComReleaseCycle
 
