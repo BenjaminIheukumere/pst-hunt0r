@@ -2,7 +2,7 @@
 .SYNOPSIS
     pst-hunt0r by Benjamin Iheukumere | b.iheukumere@safelink-it.com
     Scans ZIP files on a network share for PST files and searches them
-    for emails where the sender or any recipient ends with @example.com.
+    for emails where the sender or any recipient ends with a target domain.
 
 .DESCRIPTION
     - Recursively scans a root folder for *.zip files
@@ -12,7 +12,7 @@
     - Opens each PST via Outlook/MAPI
     - Recursively traverses all folders and mail items
     - Checks sender and all recipients against the target domain
-    - Writes all hits to a CSV file
+    - Writes each hit immediately to a CSV file
     - Shows progress per ZIP and overall, including ETA and elapsed time
 
 .REQUIREMENTS
@@ -24,19 +24,18 @@
 
 .NOTES
     Not suitable for password-protected ZIP files.
-    The time left for scanning is more of a guessing game...
 #>
 
 [CmdletBinding()]
 param(
     [Parameter()]
-    [string]$ZipRoot = 'Z:\path\to\your\zipped\pst\files',
+    [string]$ZipRoot = 'Z:\path\to\yout\zipped\pst\files',
 
     [Parameter()]
     [string]$TargetDomain = '@example.com',
 
     [Parameter()]
-    [string]$TempRoot = 'F:\path\for\temp\extraction\of\zipped\files',
+    [string]$TempRoot = 'F:\path\to\temp\storage\with\enough\space',
 
     [Parameter()]
     [string]$OutputCsv = '',
@@ -66,9 +65,11 @@ $script:CurrentZipWatch = $null
 $script:CurrentPstName = ''
 $script:CurrentPhase = 'Initialization'
 
-$script:ResultsRef = $null
 $script:TargetDomainNormalized = $null
 $script:PrSmtpAddressUri = "http://schemas.microsoft.com/mapi/proptag/0x39FE001F"
+$script:HitCount = 0
+$script:CsvWriter = $null
+$script:OutputCsvPath = $null
 
 # ----------------------------------------
 # Helper functions
@@ -204,10 +205,7 @@ function Update-ProgressBars {
         $overallEta = Get-EtaByUnits -CompletedUnits $script:ProcessedZipCount -TotalUnits $script:TotalZipCount -Elapsed $elapsedOverall
     }
 
-    $hitCount = 0
-    if ($null -ne $script:ResultsRef) {
-        $hitCount = $script:ResultsRef.Count
-    }
+    $hitCount = $script:HitCount
 
     $overallStatus = if ($script:OverallTotalPst -gt 0) {
         "ZIP $($script:ProcessedZipCount)/$($script:TotalZipCount) | PST $($script:OverallProcessedPst)/$($script:OverallTotalPst) | Hits $hitCount | Elapsed $(Format-Duration $elapsedOverall) | ETA $(Format-Duration $overallEta)"
@@ -285,6 +283,87 @@ function Get-ZipPstEntryCount {
     }
 }
 
+function Convert-ToCsvField {
+    param($Value)
+
+    $text = Safe-String $Value
+    $text = $text.Replace('"', '""')
+    return '"' + $text + '"'
+}
+
+function Initialize-OutputCsvWriter {
+    param([string]$Path)
+
+    $parent = Split-Path -Path $Path -Parent
+    if (-not [string]::IsNullOrWhiteSpace($parent) -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -Path $parent -ItemType Directory -Force | Out-Null
+    }
+
+    $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+    $script:CsvWriter = New-Object System.IO.StreamWriter($Path, $false, $utf8Bom)
+    $script:CsvWriter.AutoFlush = $true
+
+    $headerFields = @(
+        'ZipFile',
+        'PstFile',
+        'FolderPath',
+        'Subject',
+        'Sender',
+        'Recipients',
+        'SentOn',
+        'ReceivedTime',
+        'SenderHit',
+        'RecipientHit'
+    )
+
+    $quotedHeaderFields = $headerFields | ForEach-Object { Convert-ToCsvField $_ }
+    $header = $quotedHeaderFields -join ';'
+
+    $script:CsvWriter.WriteLine($header)
+}
+
+function Close-OutputCsvWriter {
+    if ($null -ne $script:CsvWriter) {
+        try {
+            $script:CsvWriter.Flush()
+            $script:CsvWriter.Dispose()
+        }
+        catch {
+            # Intentionally ignored
+        }
+        finally {
+            $script:CsvWriter = $null
+        }
+    }
+}
+
+function Write-HitToCsv {
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$Row
+    )
+
+    if ($null -eq $script:CsvWriter) {
+        throw "CSV writer is not initialized."
+    }
+
+    $line = @(
+        Convert-ToCsvField $Row.ZipFile
+        Convert-ToCsvField $Row.PstFile
+        Convert-ToCsvField $Row.FolderPath
+        Convert-ToCsvField $Row.Subject
+        Convert-ToCsvField $Row.Sender
+        Convert-ToCsvField $Row.Recipients
+        Convert-ToCsvField $Row.SentOn
+        Convert-ToCsvField $Row.ReceivedTime
+        Convert-ToCsvField ([string]$Row.SenderHit)
+        Convert-ToCsvField ([string]$Row.RecipientHit)
+    ) -join ';'
+
+    $script:CsvWriter.WriteLine($line)
+    $script:HitCount++
+}
+
 function Get-SmtpFromAddressEntry {
     param($AddressEntry)
 
@@ -349,7 +428,7 @@ function Get-SenderSmtp {
 function Get-RecipientSmtps {
     param($MailItem)
 
-    $list = [System.Collections.Generic.List[string]]::new()
+    $list = New-Object 'System.Collections.Generic.List[string]'
 
     try {
         $count = $MailItem.Recipients.Count
@@ -382,7 +461,7 @@ function Get-RecipientSmtps {
             }
 
             if ($address -and -not $list.Contains($address)) {
-                $list.Add($address)
+                [void]$list.Add($address)
             }
         }
         catch {
@@ -455,8 +534,7 @@ function Search-MailFolderRecursive {
     param(
         $Folder,
         [string]$ZipFile,
-        [string]$PstFile,
-        [System.Collections.Generic.List[object]]$Results
+        [string]$PstFile
     )
 
     $folderPath = Get-FolderPathSafe -Folder $Folder
@@ -498,7 +576,7 @@ function Search-MailFolderRecursive {
                 }
 
                 if ($senderHit -or $recipientHit) {
-                    $Results.Add([PSCustomObject]@{
+                    $row = [PSCustomObject]@{
                         ZipFile      = $ZipFile
                         PstFile      = $PstFile
                         FolderPath   = $folderPath
@@ -509,7 +587,9 @@ function Search-MailFolderRecursive {
                         ReceivedTime = (Get-DateString $item.ReceivedTime)
                         SenderHit    = $senderHit
                         RecipientHit = $recipientHit
-                    })
+                    }
+
+                    Write-HitToCsv -Row $row
                 }
             }
             catch {
@@ -536,7 +616,7 @@ function Search-MailFolderRecursive {
             $sub = $null
             try {
                 $sub = $subFolders.Item($j)
-                Search-MailFolderRecursive -Folder $sub -ZipFile $ZipFile -PstFile $PstFile -Results $Results
+                Search-MailFolderRecursive -Folder $sub -ZipFile $ZipFile -PstFile $PstFile
             }
             catch {
                 Write-WarnMsg "Error entering a subfolder under '$folderPath' in PST '$PstFile': $($_.Exception.Message)"
@@ -558,8 +638,7 @@ function Process-PstFile {
     param(
         $Namespace,
         [string]$PstPath,
-        [string]$ZipFile,
-        [System.Collections.Generic.List[object]]$Results
+        [string]$ZipFile
     )
 
     Write-Info "Opening PST: $PstPath"
@@ -578,7 +657,7 @@ function Process-PstFile {
         }
 
         $rootFolder = $store.GetRootFolder()
-        Search-MailFolderRecursive -Folder $rootFolder -ZipFile $ZipFile -PstFile $PstPath -Results $Results
+        Search-MailFolderRecursive -Folder $rootFolder -ZipFile $ZipFile -PstFile $PstPath
     }
     finally {
         if ($storeAdded -and $rootFolder) {
@@ -598,8 +677,7 @@ function Process-PstFile {
 function Process-ZipFile {
     param(
         [pscustomobject]$ZipInventory,
-        $Namespace,
-        [System.Collections.Generic.List[object]]$Results
+        $Namespace
     )
 
     $zip = $ZipInventory.ZipFile
@@ -629,7 +707,6 @@ function Process-ZipFile {
         Update-ProgressBars
 
         $pstFiles = Get-ChildItem -Path $extractDir -Recurse -File -Filter '*.pst' -ErrorAction Stop
-
         $actualPstCount = @($pstFiles).Count
 
         if ($actualPstCount -ne [int]$ZipInventory.PstEntryCount) {
@@ -651,7 +728,7 @@ function Process-ZipFile {
             Update-ProgressBars
 
             try {
-                Process-PstFile -Namespace $Namespace -PstPath $pst.FullName -ZipFile $zip.FullName -Results $Results
+                Process-PstFile -Namespace $Namespace -PstPath $pst.FullName -ZipFile $zip.FullName
             }
             catch {
                 Write-WarnMsg "Error processing PST '$($pst.FullName)' from ZIP '$($zip.FullName)': $($_.Exception.Message)"
@@ -703,6 +780,8 @@ if ([string]::IsNullOrWhiteSpace($OutputCsv)) {
     $OutputCsv = Join-Path -Path $TempRoot -ChildPath ("PstFarfetchHits_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 }
 
+$script:OutputCsvPath = $OutputCsv
+
 $script:TargetDomainNormalized = (Normalize-Email -Value $TargetDomain)
 if (-not $script:TargetDomainNormalized) {
     throw "TargetDomain is empty or invalid."
@@ -714,10 +793,11 @@ if (-not ($script:TargetDomainNormalized.StartsWith('@'))) {
 
 $outlook = $null
 $namespace = $null
-$results = [System.Collections.Generic.List[object]]::new()
-$script:ResultsRef = $results
 
 try {
+    Initialize-OutputCsvWriter -Path $script:OutputCsvPath
+    Write-Info "CSV will be written incrementally to: $script:OutputCsvPath"
+
     $script:CurrentPhase = 'Searching for ZIP files'
     Update-ProgressBars
 
@@ -733,7 +813,7 @@ try {
     $script:TotalZipCount = $zipFiles.Count
     Write-Info ("Found {0} ZIP file(s)." -f $script:TotalZipCount)
 
-    $zipInventory = [System.Collections.Generic.List[object]]::new()
+    $zipInventory = New-Object 'System.Collections.Generic.List[object]'
 
     for ($i = 0; $i -lt $zipFiles.Count; $i++) {
         $zip = $zipFiles[$i]
@@ -751,7 +831,7 @@ try {
             Write-WarnMsg "ZIP contents could not be pre-analyzed: $($zip.FullName) - $scanError"
         }
 
-        $zipInventory.Add([PSCustomObject]@{
+        [void]$zipInventory.Add([PSCustomObject]@{
             ZipFile       = $zip
             PstEntryCount = $pstEntryCount
             ScanError     = $scanError
@@ -777,7 +857,7 @@ try {
         $script:CurrentZipIndex = $z + 1
 
         try {
-            Process-ZipFile -ZipInventory $zipInfo -Namespace $namespace -Results $results
+            Process-ZipFile -ZipInventory $zipInfo -Namespace $namespace
         }
         catch {
             Write-WarnMsg "Error processing ZIP '$($zipInfo.ZipFile.FullName)': $($_.Exception.Message)"
@@ -792,22 +872,15 @@ try {
 
     $script:CurrentZipName = ''
     $script:CurrentPstName = ''
-    $script:CurrentPhase = 'Writing CSV'
-    Update-ProgressBars
-
-    Write-Info ("Total hits: {0}" -f $results.Count)
-
-    $results |
-        Sort-Object ZipFile, PstFile, FolderPath, SentOn, Subject |
-        Export-Csv -Path $OutputCsv -Delimiter ';' -NoTypeInformation -Encoding UTF8
-
-    Write-Info "CSV written: $OutputCsv"
-
     $script:CurrentPhase = 'Completed'
     Update-ProgressBars
+
+    Write-Info ("Total hits written to CSV: {0}" -f $script:HitCount)
+    Write-Info "CSV ready: $script:OutputCsvPath"
 }
 finally {
     Complete-ProgressBars
+    Close-OutputCsvWriter
 
     Release-ComObject -Obj $namespace
     Release-ComObject -Obj $outlook
