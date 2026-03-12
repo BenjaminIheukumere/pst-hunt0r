@@ -34,34 +34,34 @@ $ErrorActionPreference = 'Stop'
 # Configuration - edit these values before running the script
 # ------------------------------------------------------------
 $Config = [ordered]@{
-    ZipRoot                     = 'Z:\path\to\your\zipped\psts'
-    TargetDomain                = '@example.com'
+    ZipRoot                       = 'Z:\path\to\your\zipped\PST\files'
+    TargetDomain                  = '@farfetch.com'
 
-    TempRoot                    = 'F:\path\to\your\temp\folder'
-    OutputCsv                   = ''   # If empty: <TempRoot>\pst_hunt0r_results.csv
-    StateRoot                   = ''   # If empty: <TempRoot>\state
-    FoundMailsRoot              = ''   # If empty: <TempRoot>\found_mails
+    TempRoot                      = 'F:\path\to\your\temp\folder'
+    OutputCsv                     = ''   # If empty: <TempRoot>\pst_hunt0r_results.csv
+    StateRoot                     = ''   # If empty: <TempRoot>\state
+    FoundMailsRoot                = ''   # If empty: <TempRoot>\found_mails
 
-    ExportMatchedMails          = $true
-    ExportFormat                = 'msg'   # msg | eml
+    ExportMatchedMails            = $true
+    ExportFormat                  = 'msg'   # msg | eml
 
-    EnableResume                = $true
-    StrictStateSafety           = $true
-    StartFresh                  = $false
+    EnableResume                  = $true
+    StrictStateSafety             = $true
+    StartFresh                    = $false
 
-    KeepExtractedFiles          = $false
+    KeepExtractedFiles            = $false
 
-    DeleteRetryCount            = 10
-    DeleteRetryDelayMs          = 750
+    DeleteRetryCount              = 10
+    DeleteRetryDelayMs            = 750
 
     # Outlook / RPC robustness
-    PstRetryCount               = 4
-    OutlookStartRetryCount      = 4
-    OutlookStartRetryDelayMs    = 3000
-    OutlookRecoveryDelayMs      = 4000
-    InterPstDelayMs             = 300
-    RecycleOutlookSessionAfterPst = 8
-    ForceOutlookQuitOnRecovery  = $false
+    PstRetryCount                 = 6
+    OutlookStartRetryCount        = 5
+    OutlookStartRetryDelayMs      = 4000
+    OutlookRecoveryDelayMs        = 6000
+    InterPstDelayMs               = 500
+    RecycleOutlookSessionAfterPst = 3
+    ForceOutlookQuitOnRecovery    = $true
 }
 
 # ------------------------------------------------------------
@@ -86,28 +86,28 @@ $script:LogPath        = Join-Path -Path $Config.StateRoot -ChildPath 'pst_hunt0
 # ------------------------------------------------------------
 # Script state
 # ------------------------------------------------------------
-$script:RunWatch                = [System.Diagnostics.Stopwatch]::StartNew()
-$script:TotalZipCount           = 0
-$script:ProcessedZipCount       = 0
-$script:OverallTotalPst         = 0
-$script:OverallProcessedPst     = 0
-$script:CommittedHitCount       = 0
+$script:RunWatch               = [System.Diagnostics.Stopwatch]::StartNew()
+$script:TotalZipCount          = 0
+$script:ProcessedZipCount      = 0
+$script:OverallTotalPst        = 0
+$script:OverallProcessedPst    = 0
+$script:CommittedHitCount      = 0
 
-$script:CurrentZipName          = ''
-$script:CurrentZipIndex         = 0
-$script:CurrentZipTotalPst      = 0
-$script:CurrentZipProcessedPst  = 0
-$script:CurrentZipWatch         = $null
-$script:CurrentPstName          = ''
-$script:CurrentPhase            = 'Initialization'
+$script:CurrentZipName         = ''
+$script:CurrentZipIndex        = 0
+$script:CurrentZipTotalPst     = 0
+$script:CurrentZipProcessedPst = 0
+$script:CurrentZipWatch        = $null
+$script:CurrentPstName         = ''
+$script:CurrentPhase           = 'Initialization'
 
-$script:TargetDomainNormalized  = $null
-$script:PrSmtpAddressUri        = "http://schemas.microsoft.com/mapi/proptag/0x39FE001F"
+$script:TargetDomainNormalized = $null
+$script:PrSmtpAddressUri       = "http://schemas.microsoft.com/mapi/proptag/0x39FE001F"
 
-$script:CheckpointState         = $null
-$script:OutlookApp              = $null
-$script:OutlookNamespace        = $null
-$script:ProcessedPstInSession   = 0
+$script:CheckpointState        = $null
+$script:OutlookApp             = $null
+$script:OutlookNamespace       = $null
+$script:ProcessedPstInSession  = 0
 
 $script:CsvColumns = @(
     'ZipFile',
@@ -750,7 +750,22 @@ function Test-IsRecoverableOutlookSessionError {
         'von seinen clients getrennt',
         'server threw an exception',
         'the message filter indicated that the application is busy',
-        'call was rejected by callee'
+        'call was rejected by callee',
+
+        'error loading the outlook data file',
+        'fehler beim laden der outlook-datendatei',
+        'outlook-datendatei (.pst) für diese sitzung',
+        'outlook data file (.pst) for this session',
+
+        'property "count" cannot be found',
+        "the property 'count' cannot be found",
+        'eigenschaft "count" wurde für dieses objekt nicht gefunden',
+        'die eigenschaft "count" wurde für dieses objekt nicht gefunden',
+
+        'property "item" cannot be found',
+        "the property 'item' cannot be found",
+        'eigenschaft "item" wurde für dieses objekt nicht gefunden',
+        'die eigenschaft "item" wurde für dieses objekt nicht gefunden'
     )
 
     foreach ($msg in $messages) {
@@ -766,7 +781,9 @@ function Test-IsRecoverableOutlookSessionError {
         '0x800706be', # RPC_S_CALL_FAILED
         '0x80010108', # RPC_E_DISCONNECTED
         '0x80010105', # RPC_E_SERVERFAULT
-        '0x80010001'  # RPC_E_CALL_REJECTED / call rejected by callee family
+        '0x80010001', # RPC_E_CALL_REJECTED family
+        '0x80040119', # often seen with MAPI store/provider problems
+        '0x80040600'  # store / PST provider related failures
     )
 
     foreach ($hr in $hresults) {
@@ -877,6 +894,55 @@ function Reset-OutlookSession {
 }
 
 # ------------------------------------------------------------
+# COM collection helpers
+# ------------------------------------------------------------
+
+function Get-ComCount {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Collection,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Context
+    )
+
+    if ($null -eq $Collection) {
+        throw (New-Object System.Exception("COM collection is null: $Context"))
+    }
+
+    try {
+        return [int]$Collection.Count
+    }
+    catch {
+        throw (New-Object System.Exception(("Failed to read COM Count in context '{0}': {1}" -f $Context, $_.Exception.Message), $_.Exception))
+    }
+}
+
+function Get-ComItemByIndex {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Collection,
+
+        [Parameter(Mandatory = $true)]
+        [int]$Index,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Context
+    )
+
+    if ($null -eq $Collection) {
+        throw (New-Object System.Exception("COM collection is null: $Context"))
+    }
+
+    try {
+        return $Collection.Item($Index)
+    }
+    catch {
+        throw (New-Object System.Exception(("Failed to read COM item #{0} in context '{1}': {2}" -f $Index, $Context, $_.Exception.Message), $_.Exception))
+    }
+}
+
+# ------------------------------------------------------------
 # Mail parsing helpers
 # ------------------------------------------------------------
 
@@ -957,48 +1023,62 @@ function Get-RecipientSmtps {
 
     $list = New-Object 'System.Collections.Generic.List[string]'
 
+    $recipientsCollection = $null
     try {
-        $count = $MailItem.Recipients.Count
-    }
-    catch {
-        return @()
-    }
+        $recipientsCollection = $MailItem.Recipients
+        $count = Get-ComCount -Collection $recipientsCollection -Context "MailItem.Recipients"
 
-    for ($i = 1; $i -le $count; $i++) {
-        $recipient = $null
+        for ($i = 1; $i -le $count; $i++) {
+            $recipient = $null
 
-        try {
-            $recipient = $MailItem.Recipients.Item($i)
-
-            $address = $null
             try {
-                $address = Get-SmtpFromAddressEntry -AddressEntry $recipient.AddressEntry
-            }
-            catch {
-                # fallback below
-            }
+                $recipient = Get-ComItemByIndex -Collection $recipientsCollection -Index $i -Context "MailItem.Recipients"
 
-            if (-not $address) {
+                $address = $null
                 try {
-                    $address = Normalize-Email -Value $recipient.Address
+                    $address = Get-SmtpFromAddressEntry -AddressEntry $recipient.AddressEntry
                 }
                 catch {
-                    $address = $null
+                    if (Test-IsRecoverableOutlookSessionError -Exception $_.Exception) {
+                        throw
+                    }
+                }
+
+                if (-not $address) {
+                    try {
+                        $address = Normalize-Email -Value $recipient.Address
+                    }
+                    catch {
+                        if (Test-IsRecoverableOutlookSessionError -Exception $_.Exception) {
+                            throw
+                        }
+                        $address = $null
+                    }
+                }
+
+                if ($address -and -not $list.Contains($address)) {
+                    [void]$list.Add($address)
                 }
             }
+            catch {
+                if (Test-IsRecoverableOutlookSessionError -Exception $_.Exception) {
+                    throw
+                }
+            }
+            finally {
+                Release-ComObject -Obj $recipient
+            }
+        }
+    }
+    catch {
+        if (Test-IsRecoverableOutlookSessionError -Exception $_.Exception) {
+            throw
+        }
 
-            if ($address -and -not $list.Contains($address)) {
-                [void]$list.Add($address)
-            }
-        }
-        catch {
-            if (Test-IsRecoverableOutlookSessionError -Exception $_.Exception) {
-                throw
-            }
-        }
-        finally {
-            Release-ComObject -Obj $recipient
-        }
+        return @()
+    }
+    finally {
+        Release-ComObject -Obj $recipientsCollection
     }
 
     return $list.ToArray()
@@ -1029,14 +1109,14 @@ function Get-StoreByFilePath {
     $stores = $null
     try {
         $stores = $Namespace.Stores
-        $count = $stores.Count
+        $count = Get-ComCount -Collection $stores -Context "Namespace.Stores"
 
         for ($i = 1; $i -le $count; $i++) {
             $store   = $null
             $isMatch = $false
 
             try {
-                $store = $stores.Item($i)
+                $store = Get-ComItemByIndex -Collection $stores -Index $i -Context "Namespace.Stores"
                 if ($store -and $store.FilePath -and ([string]::Equals($store.FilePath, $PstPath, [System.StringComparison]::OrdinalIgnoreCase))) {
                     $isMatch = $true
                     return $store
@@ -1056,6 +1136,37 @@ function Get-StoreByFilePath {
     }
     finally {
         Release-ComObject -Obj $stores
+    }
+
+    return $null
+}
+
+function Wait-ForStoreByFilePath {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Namespace,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PstPath,
+
+        [int]$MaxAttempts = 10,
+        [int]$DelayMs = 500
+    )
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            $store = Get-StoreByFilePath -Namespace $Namespace -PstPath $PstPath
+            if ($null -ne $store) {
+                return $store
+            }
+        }
+        catch {
+            if (Test-IsRecoverableOutlookSessionError -Exception $_.Exception) {
+                throw
+            }
+        }
+
+        Start-Sleep -Milliseconds $DelayMs
     }
 
     return $null
@@ -1476,12 +1587,12 @@ function Get-ZipInventory {
     }
 
     return [PSCustomObject]@{
-        ZipFile           = $ZipFile
-        TotalPstEntries   = $totalPstEntries
-        CompletedSkipped  = $completedSkipped
-        PendingEntries    = $pendingEntries
-        PendingLookup     = $pendingLookup
-        PendingCount      = $pendingEntries.Count
+        ZipFile          = $ZipFile
+        TotalPstEntries  = $totalPstEntries
+        CompletedSkipped = $completedSkipped
+        PendingEntries   = $pendingEntries
+        PendingLookup    = $pendingLookup
+        PendingCount     = $pendingEntries.Count
     }
 }
 
@@ -1508,13 +1619,13 @@ function Search-MailFolderRecursive {
     $items = $null
     try {
         $items = $Folder.Items
-        $itemCount = $items.Count
+        $itemCount = Get-ComCount -Collection $items -Context ("Folder.Items [{0}]" -f $folderPath)
 
         for ($i = 1; $i -le $itemCount; $i++) {
             $item = $null
 
             try {
-                $item = $items.Item($i)
+                $item = Get-ComItemByIndex -Collection $items -Index $i -Context ("Folder.Items [{0}]" -f $folderPath)
 
                 $isMail = $false
                 try {
@@ -1592,13 +1703,13 @@ function Search-MailFolderRecursive {
     $subFolders = $null
     try {
         $subFolders = $Folder.Folders
-        $subCount = $subFolders.Count
+        $subCount = Get-ComCount -Collection $subFolders -Context ("Folder.Folders [{0}]" -f $folderPath)
 
         for ($j = 1; $j -le $subCount; $j++) {
             $sub = $null
 
             try {
-                $sub = $subFolders.Item($j)
+                $sub = Get-ComItemByIndex -Collection $subFolders -Index $j -Context ("Folder.Folders [{0}]" -f $folderPath)
                 Search-MailFolderRecursive -Folder $sub -ZipFilePath $ZipFilePath -PstRelativePath $PstRelativePath -StageContext $StageContext
             }
             catch {
@@ -1650,12 +1761,23 @@ function Process-PstFile {
     $storeAdded = $false
 
     try {
+        try {
+            $null = $Namespace.Stores.Count
+        }
+        catch {
+            if (Test-IsRecoverableOutlookSessionError -Exception $_.Exception) {
+                throw
+            }
+        }
+
         $Namespace.AddStore($PstPath)
         $storeAdded = $true
 
-        $store = Get-StoreByFilePath -Namespace $Namespace -PstPath $PstPath
+        Start-Sleep -Milliseconds 800
+
+        $store = Wait-ForStoreByFilePath -Namespace $Namespace -PstPath $PstPath -MaxAttempts 12 -DelayMs 500
         if (-not $store) {
-            throw "Could not find the opened PST in the Outlook profile."
+            throw "Could not find the opened PST in the Outlook profile after AddStore()."
         }
 
         $rootFolder = $store.GetRootFolder()
@@ -1677,7 +1799,7 @@ function Process-PstFile {
         Release-ComObject -Obj $store
 
         Invoke-ComReleaseCycle
-        Start-Sleep -Milliseconds 500
+        Start-Sleep -Milliseconds 800
     }
 }
 
