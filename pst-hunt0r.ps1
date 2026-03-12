@@ -35,7 +35,7 @@ $ErrorActionPreference = 'Stop'
 # ------------------------------------------------------------
 $Config = [ordered]@{
     ZipRoot                       = 'Z:\path\to\your\zipped\PST\files'
-    TargetDomain                  = '@farfetch.com'
+    TargetDomain                  = '@example.com'
 
     TempRoot                      = 'F:\path\to\your\temp\folder'
     OutputCsv                     = ''   # If empty: <TempRoot>\pst_hunt0r_results.csv
