@@ -5,6 +5,9 @@ PST Hunt0r is a PowerShell hunting utility for digging through ZIP archives that
 It recursively scans ZIP collections, extracts embedded PST files, opens them via Outlook/MAPI, walks every mail folder, and exports all matching results to a clean CSV file. Progress bars, elapsed time, and ETA are included, so you can watch the beast chew through archives instead of staring into the void.
 
 * * *
+## Screenshot of pst-hunt0r in action
+![Screenshot of pst-hunt0r in action](https://github.com/BenjaminIheukumere/pst-hunt0r/blob/main/pst_hunt0r.png)
+* * *
 
 ## Features
 
